@@ -190,6 +190,46 @@ function getBearerToken(req) {
   return authHeader.slice('Bearer '.length).trim() || null;
 }
 
+function decodeJwtPayload(token) {
+  if (!token || !token.includes('.')) return null;
+
+  try {
+    const payload = token.split('.')[1];
+    const normalized = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+    return JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function pickCanonicalUserId(...candidates) {
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const trimmed = candidate.trim();
+    if (trimmed) return trimmed;
+  }
+  return null;
+}
+
+function resolveCanonicalUserId({ req, explicitUserId = null, profile = null } = {}) {
+  const tokenPayload = decodeJwtPayload(getBearerToken(req));
+
+  return pickCanonicalUserId(
+    tokenPayload?.userId,
+    tokenPayload?.user_id,
+    profile?.userId,
+    profile?.id,
+    profile?.user_id,
+    profile?.user?.userId,
+    profile?.user?.id,
+    profile?.user?.user_id,
+    explicitUserId,
+    profile?.email,
+    profile?.user?.email,
+  );
+}
+
 function toAgentProfileContext(rawProfile) {
   if (!rawProfile || typeof rawProfile !== 'object') return {};
 
@@ -534,7 +574,7 @@ app.post('/api/chat', async (req, res) => {
     // 1. Fetch User Documents & Profile from DB with Retry
     let userDocuments = [];
     let userProfile = providedProfile || {};
-    let effectiveUserId = userId || 'anonymous';
+    let effectiveUserId = resolveCanonicalUserId({ req, explicitUserId: userId, profile: providedProfile }) || 'anonymous';
 
     const fetchUserData = async () => {
         console.log(`   📡 [Step 1] Fetching user profile from website backend...`);
@@ -551,6 +591,7 @@ app.post('/api/chat', async (req, res) => {
             
             // Note: intentionally skipping writing profile to MongoDB as extension doesn't need to persist it.
         } else if (providedProfile && typeof providedProfile === 'object') {
+            effectiveUserId = resolveCanonicalUserId({ req, explicitUserId: effectiveUserId, profile: providedProfile }) || effectiveUserId;
             userProfile = toAgentProfileContext(providedProfile);
             console.log(`👤 Using provided profile for user ${effectiveUserId} (Keys: ${Object.keys(userProfile).length})`);
         }
@@ -786,10 +827,11 @@ app.post('/api/chat', async (req, res) => {
 app.post('/api/process-document', async (req, res) => {
   try {
     const { fileName, fileDataUri, userId } = req.body;
+    const effectiveUserId = resolveCanonicalUserId({ req, explicitUserId: userId }) || userId;
     console.log(`\n   ──── 📄 DOCUMENT PROCESSING PIPELINE START ────`);
-    console.log(`   📄 File: ${fileName} | userId: ${userId}`);
+    console.log(`   📄 File: ${fileName} | userId: ${effectiveUserId}`);
 
-    if (!fileDataUri || !userId) {
+    if (!fileDataUri || !effectiveUserId) {
       return res.status(400).json({ error: 'Missing fileDataUri or userId' });
     }
 
@@ -800,7 +842,7 @@ app.post('/api/process-document', async (req, res) => {
     const docResult = await runAgent({
       trace,
       agentName: 'document_processor',
-      input: { fileName, userId, fileDataUriLength: fileDataUri?.length || 0 },
+      input: { fileName, userId: effectiveUserId, fileDataUriLength: fileDataUri?.length || 0 },
       agentFunction: () => processDocument({ fileDataUri }),
       metadata: { fileName, source: 'extension_chat_upload' },
     });
@@ -808,12 +850,12 @@ app.post('/api/process-document', async (req, res) => {
 
     // Check for duplicates by userId + documentType
     const existingDoc = await userDocumentsCollection.findOne({
-      userId,
+      userId: effectiveUserId,
       documentType: docResult.documentType,
     });
 
     const documentEvents = await logTraceCreditEvents({
-      userId,
+      userId: effectiveUserId,
       trace,
       fallbackEventType: 'extension_chat_doc',
       baseMetadata: {
@@ -825,7 +867,7 @@ app.post('/api/process-document', async (req, res) => {
     });
 
     const creditsUsed = getTraceCreditsUsed(trace);
-    const creditInfo = await buildCreditIndicator(userId, creditsUsed);
+    const creditInfo = await buildCreditIndicator(effectiveUserId, creditsUsed);
 
     if (existingDoc) {
       return res.json({
@@ -836,7 +878,7 @@ app.post('/api/process-document', async (req, res) => {
     }
 
     const documentRecord = {
-      userId,
+      userId: effectiveUserId,
       name: fileName,
       documentType: docResult.documentType,
       profileSection: docResult.profileSection,
@@ -847,7 +889,7 @@ app.post('/api/process-document', async (req, res) => {
     };
 
     await userDocumentsCollection.insertOne(documentRecord);
-    await updateUserProfile(userId, docResult.extractedData, docResult.profileSection);
+    await updateUserProfile(effectiveUserId, docResult.extractedData, docResult.profileSection);
 
     res.json({
       duplicate: false,
@@ -954,7 +996,7 @@ app.post('/api/intelligent-fill', async (req, res) => {
     console.log(`   📡 [Step 1] Fetching user profile from website backend...`);
     let userDocuments = providedDocs || [];
     let realUserProfile = {};
-    let effectiveUserId = userId || 'anonymous';
+    let effectiveUserId = resolveCanonicalUserId({ req, explicitUserId: userId }) || 'anonymous';
 
     const sourceProfile = await fetchProfileFromSource(req);
     if (sourceProfile?.resolvedUserId) {
